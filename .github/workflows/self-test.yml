@@ -1,0 +1,170 @@
+name: Self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  positive:
+    name: Fixture is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run dep5-vendor-gen action
+        id: check
+        uses: ./
+        with:
+          working-directory: tests/fixtures
+          vendor-dirs: vendor
+
+      - name: Assert up-to-date
+        run: |
+          if [[ "${{ steps.check.outputs.up-to-date }}" != "true" ]]; then
+            echo "::error::Expected fixture to be up to date, got up-to-date=${{ steps.check.outputs.up-to-date }}"
+            exit 1
+          fi
+
+  negative:
+    name: Stale copyright is detected
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mutate fixture copyright file
+        run: |
+          sed -i 's/2020 John Example/2099 Mutated Person/' tests/fixtures/debian/copyright
+
+      - name: Run dep5-vendor-gen action (fail-on-diff disabled for assertion)
+        id: check
+        uses: ./
+        with:
+          working-directory: tests/fixtures
+          vendor-dirs: vendor
+          fail-on-diff: 'false'
+
+      - name: Assert stale detection
+        env:
+          STEP_UP_TO_DATE: ${{ steps.check.outputs.up-to-date }}
+          STEP_DIFF: ${{ steps.check.outputs.diff }}
+        run: |
+          if [[ "$STEP_UP_TO_DATE" != "false" ]]; then
+            echo "::error::Expected mutated fixture to be reported as stale, got up-to-date=$STEP_UP_TO_DATE"
+            exit 1
+          fi
+          if [[ -z "$STEP_DIFF" ]]; then
+            echo "::error::Expected a non-empty diff output"
+            exit 1
+          fi
+
+  negative-fails-by-default:
+    name: Stale copyright fails the job by default
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mutate fixture copyright file
+        run: |
+          sed -i 's/2020 John Example/2099 Mutated Person/' tests/fixtures/debian/copyright
+
+      - name: Run dep5-vendor-gen action (expected to fail)
+        id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          working-directory: tests/fixtures
+          vendor-dirs: vendor
+
+      - name: Assert step failed
+        run: |
+          if [[ "${{ steps.check.outcome }}" != "failure" ]]; then
+            echo "::error::Expected the check step to fail on a stale copyright file by default"
+            exit 1
+          fi
+
+  push-fix-without-token-falls-back:
+    name: push-fix without a token falls back to failing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mutate fixture copyright file
+        run: |
+          sed -i 's/2020 John Example/2099 Mutated Person/' tests/fixtures/debian/copyright
+
+      - name: Run dep5-vendor-gen action (push-fix without token, expected to fail)
+        id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          working-directory: tests/fixtures
+          vendor-dirs: vendor
+          push-fix: 'true'
+          token: ''
+
+      - name: Assert step failed and did not push
+        run: |
+          if [[ "${{ steps.check.outcome }}" != "failure" ]]; then
+            echo "::error::Expected the check step to fail when push-fix has no token"
+            exit 1
+          fi
+          if [[ "${{ steps.check.outputs.pushed }}" != "false" ]]; then
+            echo "::error::Expected pushed=false, got pushed=${{ steps.check.outputs.pushed }}"
+            exit 1
+          fi
+
+  push-fix-pushes-commit:
+    name: push-fix commits and pushes the regenerated file
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point origin at an isolated local remote
+        id: setup
+        run: |
+          remote_dir="$(mktemp -d)"
+          git init --bare "$remote_dir"
+          git remote set-url origin "$remote_dir"
+          git push origin "HEAD:refs/heads/${{ github.ref_name }}"
+          echo "remote_dir=$remote_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Mutate fixture copyright file
+        run: |
+          sed -i 's/2020 John Example/2099 Mutated Person/' tests/fixtures/debian/copyright
+
+      - name: Run dep5-vendor-gen action (push-fix against the isolated remote)
+        id: check
+        uses: ./
+        with:
+          working-directory: tests/fixtures
+          vendor-dirs: vendor
+          push-fix: 'true'
+          token: 'unused-because-remote-is-local'
+
+      - name: Assert a fix commit was pushed
+        run: |
+          if [[ "${{ steps.check.outputs.pushed }}" != "true" ]]; then
+            echo "::error::Expected pushed=true, got pushed=${{ steps.check.outputs.pushed }}"
+            exit 1
+          fi
+
+          pushed_copyright="$(git show "origin/${{ github.ref_name }}:tests/fixtures/debian/copyright")"
+          if ! grep -q "2020 John Example" <<< "$pushed_copyright"; then
+            echo "::error::Expected the pushed copyright file to be regenerated back to the original content"
+            exit 1
+          fi
+          if grep -q "Mutated Person" <<< "$pushed_copyright"; then
+            echo "::error::Expected the pushed copyright file to no longer contain the mutation"
+            exit 1
+          fi
+
+          if ! git log -1 --pretty=%s "origin/${{ github.ref_name }}" | grep -q "update debian/copyright"; then
+            echo "::error::Expected a fix commit on the pushed branch"
+            exit 1
+          fi

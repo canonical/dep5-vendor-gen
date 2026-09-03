@@ -1,0 +1,142 @@
+name: 'dep5-vendor-gen: check debian/copyright freshness'
+description: >-
+  Fail CI when the committed debian/copyright (DEP-5) file is out of date
+  with the vendored dependencies, using dep5-vendor-gen.
+
+branding:
+  icon: 'file-text'
+  color: 'blue'
+
+inputs:
+  vendor-dirs:
+    description: >-
+      Space-separated list of vendor directories to scan. Leave empty to let
+      dep5-vendor-gen auto-detect ./vendor* directories.
+    required: false
+    default: ''
+  copyright-file:
+    description: 'Path (relative to working-directory) to the debian/copyright file to check.'
+    required: false
+    default: 'debian/copyright'
+  working-directory:
+    description: 'Directory to run the check in.'
+    required: false
+    default: '.'
+  fail-on-diff:
+    description: >-
+      Whether to fail the action when the copyright file is out of date.
+      Set to "false" to only warn and still expose the up-to-date/diff outputs.
+    required: false
+    default: 'true'
+  pre-run:
+    description: >-
+      Optional shell command to run in working-directory before scanning, to
+      materialise vendor directories (e.g. "go mod vendor" or
+      "cargo vendor vendor_rust").
+    required: false
+    default: ''
+  debug:
+    description: 'Pass --debug to dep5-vendor-gen for verbose logging.'
+    required: false
+    default: 'false'
+  push-fix:
+    description: >-
+      Opt-in "fix mode". When "true" and the copyright file is out of date,
+      the action commits the regenerated file and pushes it to the current
+      branch instead of (only) failing, using the `token` input (the
+      workflow's GITHUB_TOKEN by default). Pushes made with the default
+      GITHUB_TOKEN do not retrigger workflows, so a PR would be left with no
+      check reported on the new commit; set `token` to a PAT/GitHub App
+      token to retrigger status checks. Pushing is skipped (falling back to
+      the normal fail/warn behaviour) for pull requests from forks, since
+      the token cannot push to the fork.
+    required: false
+    default: 'false'
+  token:
+    description: >-
+      Token used to push the fix commit when push-fix is "true". Not
+      required: defaults to the workflow's own GITHUB_TOKEN. The default
+      GITHUB_TOKEN needs "contents: write" permission (and, for pull
+      requests, permission to push to the PR branch) for the push to
+      succeed, but pushes made with it do not retrigger workflows. Pass a
+      PAT or GitHub App installation token instead so the resulting push
+      retriggers required status checks.
+    required: false
+    default: ${{ github.token }}
+  commit-message:
+    description: 'Commit message used when push-fix pushes an update.'
+    required: false
+    default: 'chore: update debian/copyright via dep5-vendor-gen'
+  commit-user-name:
+    description: 'git user.name used for the fix commit when push-fix is "true".'
+    required: false
+    default: 'github-actions[bot]'
+  commit-user-email:
+    description: 'git user.email used for the fix commit when push-fix is "true".'
+    required: false
+    default: '41898282+github-actions[bot]@users.noreply.github.com'
+
+outputs:
+  up-to-date:
+    description: '"true" if the copyright file matches what dep5-vendor-gen generates, "false" otherwise.'
+    value: ${{ steps.check.outputs.up-to-date }}
+  diff:
+    description: 'Unified diff between the committed and regenerated copyright file (empty when up to date).'
+    value: ${{ steps.check.outputs.diff }}
+  pushed:
+    description: '"true" if push-fix pushed a fix commit, "false" otherwise.'
+    value: ${{ steps.check.outputs.pushed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y licensecheck python3-pip
+        # python3-anytree isn't packaged on all supported Ubuntu releases
+        # (e.g. noble/24.04), so fall back to pip if apt doesn't have it.
+        if ! sudo apt-get install --no-install-recommends -y python3-anytree; then
+          pip install --break-system-packages anytree
+        fi
+
+    - name: Log tool versions
+      shell: bash
+      run: |
+        {
+          echo "### dep5-vendor-gen tool versions"
+          echo
+          echo '```'
+          licensecheck --version
+          dpkg-query -W -f='${Package} ${Version}\n' licensecheck
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Run pre-run command
+      if: ${{ inputs.pre-run != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ inputs.pre-run }}
+
+    - name: Check debian/copyright freshness
+      id: check
+      shell: bash
+      env:
+        COPYRIGHT_FILE: ${{ inputs.copyright-file }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        VENDOR_DIRS: ${{ inputs.vendor-dirs }}
+        FAIL_ON_DIFF: ${{ inputs.fail-on-diff }}
+        DEBUG: ${{ inputs.debug }}
+        DEP5_VENDOR_GEN: ${{ github.action_path }}/dep5-vendor-gen
+        PUSH_FIX: ${{ inputs.push-fix }}
+        TOKEN: ${{ inputs.token }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        COMMIT_USER_NAME: ${{ inputs.commit-user-name }}
+        COMMIT_USER_EMAIL: ${{ inputs.commit-user-email }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_HEAD_REF: ${{ github.head_ref }}
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        PUSH_REF_NAME: ${{ github.ref_name }}
+      run: ${{ github.action_path }}/.github/scripts/check-copyright.sh
